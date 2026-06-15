@@ -1,10 +1,12 @@
 #![no_std]
 
 mod errors;
+mod token_utils;
 mod types;
 
 use crate::errors::EscrowError;
-use crate::types::{DataKey, EscrowConfig};
+use crate::token_utils::get_token_client;
+use crate::types::{BorrowerRecord, DataKey, EscrowConfig};
 use soroban_sdk::{contract, contractimpl, Address, Env};
 
 const INSTANCE_BUMP_AMOUNT: u32 = 518_400; // ~30 days
@@ -17,6 +19,45 @@ const INSTANCE_LIFETIME_THRESHOLD: u32 = 129_600; // ~7.5 days
 /// once the savings target is met — or refunds the borrower on early withdrawal.
 #[contract]
 pub struct EscrowContract;
+
+/// Internal helpers.
+impl EscrowContract {
+    /// Read the contract config or panic if not initialized.
+    fn get_config(env: &Env) -> Result<EscrowConfig, EscrowError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(EscrowError::NotInitialized)
+    }
+
+    /// Read a borrower's record, returning a default if none exists.
+    fn get_borrower(env: &Env, borrower: &Address) -> BorrowerRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Borrower(borrower.clone()))
+            .unwrap_or(BorrowerRecord {
+                deposited: 0,
+                start_ledger: 0,
+                released: false,
+                withdrawn: false,
+            })
+    }
+
+    /// Write a borrower's record to persistent storage.
+    fn set_borrower(env: &Env, borrower: &Address, record: &BorrowerRecord) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Borrower(borrower.clone()), record);
+    }
+
+    /// Read the total pooled balance.
+    fn get_total_pooled(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalPooled)
+            .unwrap_or(0i128)
+    }
+}
 
 #[contractimpl]
 impl EscrowContract {
@@ -65,6 +106,52 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Deposit USDC into the escrow toward the borrower's savings target.
+    ///
+    /// The borrower must authorize this call. USDC is transferred from the
+    /// borrower's wallet to this contract. The borrower's balance and the
+    /// total pooled amount are updated accordingly.
+    pub fn deposit(env: Env, borrower: Address, amount: i128) -> Result<(), EscrowError> {
+        borrower.require_auth();
+
+        if amount <= 0 {
+            return Err(EscrowError::InvalidAmount);
+        }
+
+        let config = Self::get_config(&env)?;
+        let mut record = Self::get_borrower(&env, &borrower);
+
+        // Cannot deposit if already released or withdrawn.
+        if record.released {
+            return Err(EscrowError::AlreadyReleased);
+        }
+        if record.withdrawn {
+            return Err(EscrowError::AlreadyWithdrawn);
+        }
+
+        // Transfer USDC from borrower to this contract.
+        let token = get_token_client(&env, &config.token);
+        token.transfer(&borrower, &env.current_contract_address(), &amount);
+
+        // Set start ledger on first deposit.
+        if record.deposited == 0 {
+            record.start_ledger = env.ledger().sequence();
+        }
+
+        record.deposited += amount;
+        Self::set_borrower(&env, &borrower, &record);
+
+        // Update total pooled.
+        let total = Self::get_total_pooled(&env) + amount;
+        env.storage().instance().set(&DataKey::TotalPooled, &total);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        Ok(())
+    }
+
     /// Returns the contract version.
     pub fn version(env: Env) -> u32 {
         env.storage()
@@ -77,7 +164,35 @@ impl EscrowContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
+    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, Env};
+
+    /// Helper: deploy a test USDC token, mint to borrower, initialize escrow.
+    fn setup_with_token(env: &Env) -> (Address, Address, Address, EscrowContractClient<'_>) {
+        let admin = Address::generate(env);
+        let borrower = Address::generate(env);
+
+        // Deploy a test SAC token (simulates USDC).
+        let token_admin = Address::generate(env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let token_address = token_id.address();
+        let sac_client = StellarAssetClient::new(env, &token_address);
+
+        // Mint 50,000 USDC to borrower.
+        sac_client.mint(&borrower, &50_000_0000000i128);
+
+        // Register and initialize escrow.
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(env, &contract_id);
+        client.initialize(
+            &admin,
+            &token_address,
+            &10_000_0000000i128, // 10,000 USDC target
+            &518_400u32,
+            &500u32,
+        );
+
+        (admin, borrower, token_address, client)
+    }
 
     #[test]
     fn test_initialize() {
@@ -93,9 +208,9 @@ mod test {
         client.initialize(
             &admin,
             &token,
-            &10_000_0000000i128, // 10,000 USDC (7 decimals)
-            &518_400u32,         // ~30 days
-            &500u32,             // 5% penalty
+            &10_000_0000000i128,
+            &518_400u32,
+            &500u32,
         );
 
         // Verify config was stored by reading from the contract's context.
@@ -127,8 +242,40 @@ mod test {
 
         client.initialize(&admin, &token, &10_000_0000000i128, &518_400u32, &500u32);
 
-        // Second initialization should fail.
         let result = client.try_initialize(&admin, &token, &10_000_0000000i128, &518_400u32, &500u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deposit() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, borrower, token_address, client) = setup_with_token(&env);
+        let token = soroban_sdk::token::Client::new(&env, &token_address);
+
+        // Deposit 2,000 USDC.
+        client.deposit(&borrower, &2_000_0000000i128);
+
+        // Check borrower balance in contract.
+        let contract_balance = token.balance(&client.address);
+        assert_eq!(contract_balance, 2_000_0000000i128);
+
+        // Deposit again.
+        client.deposit(&borrower, &3_000_0000000i128);
+
+        let contract_balance = token.balance(&client.address);
+        assert_eq!(contract_balance, 5_000_0000000i128);
+    }
+
+    #[test]
+    fn test_deposit_zero_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, borrower, _token_address, client) = setup_with_token(&env);
+
+        let result = client.try_deposit(&borrower, &0i128);
         assert!(result.is_err());
     }
 
@@ -140,4 +287,3 @@ mod test {
         assert_eq!(client.version(), 1);
     }
 }
-
