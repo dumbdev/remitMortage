@@ -12,8 +12,14 @@ pub struct EscrowConfig {
     pub savings_target: i128,
     /// Maximum savings period in ledger-sequence increments.
     pub max_duration_ledgers: u32,
-    /// Early withdrawal penalty as basis points (e.g. 500 = 5%).
-    pub early_withdrawal_penalty_bps: u32,
+    /// Tier 1 penalty (months 1-2) in basis points (e.g. 500 = 5%).
+    pub penalty_bps_tier1: u32,
+    /// Tier 2 penalty (months 3-4) in basis points.
+    pub penalty_bps_tier2: u32,
+    /// Tier 3 penalty (months 5-6) in basis points.
+    pub penalty_bps_tier3: u32,
+    /// Tier 4 penalty (month 7+) in basis points.
+    pub penalty_bps_tier4: u32,
 }
 
 /// Tracks an individual borrower's escrow balance and status.
