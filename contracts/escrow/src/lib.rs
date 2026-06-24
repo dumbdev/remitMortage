@@ -7,10 +7,11 @@ mod types;
 use crate::errors::EscrowError;
 use crate::token_utils::get_token_client;
 use crate::types::{BorrowerRecord, DataKey, EscrowConfig};
-use soroban_sdk::{contract, contractimpl, Address, Env};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, IntoVal};
 
 const INSTANCE_BUMP_AMOUNT: u32 = 518_400; // ~30 days
 const INSTANCE_LIFETIME_THRESHOLD: u32 = 129_600; // ~7.5 days
+const LEDGERS_PER_MONTH: u32 = 518_400; // used to approximate months from ledger sequence
 
 /// Escrow Contract
 ///
@@ -72,6 +73,7 @@ impl EscrowContract {
     /// - `min_duration_ledgers` — Minimum ledgers that must elapse before release.
     ///   Approximately 518,400 per 6 months (at 5-second ledger time).
     ///   Pass 0 to disable the lockup check.
+    /// - `penalty_bps_tier1..tier4` — Penalty basis points for tiers (months 1-2, 3-4, 5-6, 7+).
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -80,6 +82,10 @@ impl EscrowContract {
         max_duration_ledgers: u32,
         early_withdrawal_penalty_bps: u32,
         min_duration_ledgers: u32,
+        penalty_bps_tier1: u32,
+        penalty_bps_tier2: u32,
+        penalty_bps_tier3: u32,
+        penalty_bps_tier4: u32,
     ) -> Result<(), EscrowError> {
         // Prevent re-initialization.
         if env.storage().instance().has(&DataKey::Config) {
@@ -100,6 +106,10 @@ impl EscrowContract {
             max_duration_ledgers,
             early_withdrawal_penalty_bps,
             min_duration_ledgers,
+            penalty_bps_tier1,
+            penalty_bps_tier2,
+            penalty_bps_tier3,
+            penalty_bps_tier4,
         };
 
         env.storage().instance().set(&DataKey::Config, &config);
@@ -154,6 +164,11 @@ impl EscrowContract {
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
+        env.events().publish(
+            (symbol_short!("deposit"),),
+            (borrower.clone(), amount, record.deposited),
+        );
+
         Ok(())
     }
 
@@ -178,8 +193,27 @@ impl EscrowContract {
             return Err(EscrowError::AlreadyWithdrawn);
         }
 
+        // Determine elapsed months (1-based).
+        let current_ledger = env.ledger().sequence();
+        let mut months_elapsed: u32 = 1u32;
+        if current_ledger > record.start_ledger {
+            let diff = current_ledger - record.start_ledger;
+            months_elapsed = 1u32 + (diff / LEDGERS_PER_MONTH);
+        }
+
+        // Map months to penalty tier.
+        let penalty_bps = if months_elapsed <= 2u32 {
+            config.penalty_bps_tier1
+        } else if months_elapsed <= 4u32 {
+            config.penalty_bps_tier2
+        } else if months_elapsed <= 6u32 {
+            config.penalty_bps_tier3
+        } else {
+            config.penalty_bps_tier4
+        };
+
         // Calculate penalty and refund.
-        let penalty = (record.deposited * config.early_withdrawal_penalty_bps as i128) / 10_000;
+        let penalty = (record.deposited * penalty_bps as i128) / 10_000;
         let refund = record.deposited - penalty;
 
         // Transfer refund back to borrower.
@@ -198,6 +232,11 @@ impl EscrowContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        env.events().publish(
+            (symbol_short!("withdraw"),),
+            (borrower.clone(), refund, penalty),
+        );
 
         Ok(refund)
     }
@@ -261,6 +300,11 @@ impl EscrowContract {
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
+        env.events().publish(
+            (symbol_short!("release"),),
+            (borrower.clone(), amount),
+        );
+
         Ok(amount)
     }
 
@@ -314,6 +358,34 @@ impl EscrowContract {
         } else {
             config.min_duration_ledgers - elapsed
         }
+    /// Returns the current penalty tier (bps) and estimated refund amount if the borrower withdraws now.
+    pub fn get_current_penalty(env: Env, borrower: Address) -> Result<(u32, i128), EscrowError> {
+        let config = Self::get_config(&env)?;
+        let record = Self::get_borrower(&env, &borrower);
+        if record.deposited == 0 {
+            return Err(EscrowError::BorrowerNotFound);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let mut months_elapsed: u32 = 1u32;
+        if current_ledger > record.start_ledger {
+            let diff = current_ledger - record.start_ledger;
+            months_elapsed = 1u32 + (diff / LEDGERS_PER_MONTH);
+        }
+
+        let penalty_bps = if months_elapsed <= 2u32 {
+            config.penalty_bps_tier1
+        } else if months_elapsed <= 4u32 {
+            config.penalty_bps_tier2
+        } else if months_elapsed <= 6u32 {
+            config.penalty_bps_tier3
+        } else {
+            config.penalty_bps_tier4
+        };
+
+        let penalty = (record.deposited * penalty_bps as i128) / 10_000;
+        let refund = record.deposited - penalty;
+        Ok((penalty_bps, refund))
     }
 
     /// Returns the contract version.
@@ -354,6 +426,10 @@ mod test {
             &518_400u32,
             &500u32,
             &0u32, // no lockup by default in helper
+            &500u32, // tier1: months 1-2 -> 5%
+            &300u32, // tier2: months 3-4 -> 3%
+            &150u32, // tier3: months 5-6 -> 1.5%
+            &50u32,  // tier4: month 7+ -> 0.5%
         );
 
         (admin, borrower, token_address, client)
@@ -377,6 +453,9 @@ mod test {
             &518_400u32,
             &500u32,
             &0u32,
+            &300u32,
+            &150u32,
+            &50u32,
         );
 
         // Verify config was stored by reading from the contract's context.
@@ -393,6 +472,10 @@ mod test {
             assert_eq!(stored_config.max_duration_ledgers, 518_400u32);
             assert_eq!(stored_config.early_withdrawal_penalty_bps, 500u32);
             assert_eq!(stored_config.min_duration_ledgers, 0u32);
+            assert_eq!(stored_config.penalty_bps_tier1, 500u32);
+            assert_eq!(stored_config.penalty_bps_tier2, 300u32);
+            assert_eq!(stored_config.penalty_bps_tier3, 150u32);
+            assert_eq!(stored_config.penalty_bps_tier4, 50u32);
         });
     }
 
@@ -407,9 +490,10 @@ mod test {
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.initialize(&admin, &token, &10_000_0000000i128, &518_400u32, &500u32);
+        client.initialize(&admin, &token, &10_000_0000000i128, &518_400u32, &500u32, &300u32, &150u32, &50u32);
 
         let result = client.try_initialize(&admin, &token, &10_000_0000000i128, &518_400u32, &500u32, &0u32);
+        let result = client.try_initialize(&admin, &token, &10_000_0000000i128, &518_400u32, &500u32, &300u32, &150u32, &50u32);
         assert!(result.is_err());
     }
 
@@ -433,6 +517,17 @@ mod test {
 
         let contract_balance = token.balance(&client.address);
         assert_eq!(contract_balance, 5_000_0000000i128);
+
+        // Verify deposit event
+        let events = env.events().all();
+        assert!(events.len() >= 2);
+        let last_event = events.last().unwrap();
+        
+        let expected_topic: soroban_sdk::Vec<soroban_sdk::Val> = soroban_sdk::vec![&env, symbol_short!("deposit").into_val(&env)];
+        assert_eq!(last_event.1, expected_topic);
+        
+        let expected_data: soroban_sdk::Val = (borrower.clone(), 3_000_0000000i128, 5_000_0000000i128).into_val(&env);
+        assert_eq!(last_event.2, expected_data);
     }
 
     #[test]
@@ -499,6 +594,10 @@ mod test {
         assert_eq!(config.savings_target, 10_000_0000000i128);
         assert_eq!(config.early_withdrawal_penalty_bps, 500u32);
         assert_eq!(config.min_duration_ledgers, 0u32);
+        assert_eq!(config.penalty_bps_tier1, 500u32);
+        assert_eq!(config.penalty_bps_tier2, 300u32);
+        assert_eq!(config.penalty_bps_tier3, 150u32);
+        assert_eq!(config.penalty_bps_tier4, 50u32);
     }
 
     #[test]

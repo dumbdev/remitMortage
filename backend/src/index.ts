@@ -3,9 +3,11 @@ import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import swaggerUi from "swagger-ui-express";
+import { swaggerSpec } from "./docs/swagger.js";
 import { healthRouter } from "./routes/health.js";
 import { verificationRouter } from "./routes/verification.js";
 import { borrowerRouter } from "./routes/borrower.js";
+import { loanRouter } from "./routes/loan.js";
 import { errorHandler } from "./middleware/errorHandler.js";
 import { swaggerSpec } from "./docs/swagger.js";
 
@@ -31,6 +33,7 @@ const verificationLimiter = rateLimit({
 app.use("/api/health", healthRouter);
 app.use("/api/verification", verificationLimiter, verificationRouter);
 app.use("/api/borrower", borrowerRouter);
+app.use("/api/loan", loanRouter);
 app.use("/api/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
 // Global error handler (must be after routes)
