@@ -9,6 +9,12 @@ export interface Config {
   usdcTokenId: string;
   pinataApiKey: string;
   pinataSecretApiKey: string;
+  smtpHost: string;
+  smtpPort: number;
+  smtpUser: string;
+  smtpPass: string;
+  smtpFrom: string;
+  webhookSecret: string;
 }
 
 export function loadConfig(): Config {
@@ -22,5 +28,11 @@ export function loadConfig(): Config {
     usdcTokenId: process.env.USDC_TOKEN_ID || "",
     pinataApiKey: process.env.PINATA_API_KEY || "",
     pinataSecretApiKey: process.env.PINATA_SECRET_API_KEY || "",
+    smtpHost: process.env.SMTP_HOST || "localhost",
+    smtpPort: parseInt(process.env.SMTP_PORT || "587", 10),
+    smtpUser: process.env.SMTP_USER || "",
+    smtpPass: process.env.SMTP_PASS || "",
+    smtpFrom: process.env.SMTP_FROM || "no-reply@remitmortgage.com",
+    webhookSecret: process.env.WEBHOOK_SECRET || "default_signing_secret_key",
   };
 }
